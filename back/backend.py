@@ -1,54 +1,155 @@
-# main.py
-from fastapi import FastAPI,Request
+# server.py
 import os
+import base64
+import secrets
+import hmac
+import hashlib
+from fastapi import FastAPI
 from pydantic import BaseModel
-import opaque
 from dotenv import load_dotenv
-load_dotenv()
+from pymongo import MongoClient
+from spake2 import SPAKE2_Symmetric
+from helper.converter import b64d,b64e,hmac_sha256
+from models.models import RegisterRequest,ChallengeRequest,LoginFinishRequest,LoginStartRequest
 
-app = FastAPI()
+load_dotenv()
+MONGO_URI = os.getenv("MONGO_URI")
+if not MONGO_URI:
+    raise RuntimeError("MONGO_URI is missing in .env")
+
+mongo = MongoClient(MONGO_URI)
+db = mongo["pake_demo"]
+users = db["users"]         # { username, salt_b64, verifier_b64 }
+sessions = db["sessions"]   # { session_id, key_b64, username }
+
+# Indexes
+users.create_index("username", unique=True)
+sessions.create_index("session_id", unique=True)
+
+# ---------- FastAPI ----------
+app = FastAPI(title="SPAKE2 PAKE Demo with MongoDB")
+
 
 @app.get("/")
 def home():
-    return "Welcome to SPAKE @ AUTh"
-# In a real app, the server's long-term private key and a user database would be managed
-# in a more secure way. For this project, we'll keep it simple.
-# You only need to run this ONCE to generate the key and store it securely.
-# Let's assume you've already generated and stored it.
-# server_sk = opaque.ServerSetup() 
-# You can generate this and save it to a file. For our example, we will just use a predefined value.
-SERVER_PRIVATE_KEY = os.getenv("SERVER_PRIVATE_KEY").encode('utf-8')
-DATABASE = {}
-
-class RegisterRequest(BaseModel):
-    username: str
-    client_request: str # We'll send this as a base64 encoded string
-class FinalizeRegisterRequest(BaseModel):
-    username: str
-    client_record: str
+    return {"ok": True, "message": "SPAKE2 PAKE demo (MongoDB) — password never sent during login."}
 
 @app.post("/register")
-async def register_user(request: RegisterRequest):
-    # This is the server's part of the registration
-    # The server receives the client's request
-    client_request_bytes = request.client_request.encode('utf-8')
+def register(req: RegisterRequest):
+    if users.find_one({"username": req.username}):
+        return {"ok": False, "error": "User already exists"}
 
-    # The server responds with its part of the OPRF calculation
-    server_response = opaque.create_registration_response(client_request_bytes, SERVER_PRIVATE_KEY)
-    
-    # Send the response back to the client
-    return {"server_response": server_response.decode('utf-8')}
+    # Validate base64
+    try:
+        _ = b64d(req.salt_b64)
+        _ = b64d(req.verifier_b64)
+    except Exception:
+        return {"ok": False, "error": "Invalid base64 for salt/verifier"}
+
+    users.insert_one({
+        "username": req.username,
+        "salt_b64": req.salt_b64,
+        "verifier_b64": req.verifier_b64,
+    })
+    return {"ok": True, "message": "Registered"}
+
+@app.post("/login/challenge")
+def login_challenge(req: ChallengeRequest):
+    user = users.find_one({"username": req.username})
+    if not user:
+        return {"ok": False, "error": "User not found"}
+    return {"ok": True, "salt_b64": user["salt_b64"]}
+
+@app.post("/login/start")
+def login_start(req: LoginStartRequest):
+    # debug
+    print("LOGIN START request:", req)
+
+    user = users.find_one({"username": req.username})
+    if not user:
+        return {"ok": False, "error": "User not found"}
+
+    try:
+        verifier = b64d(user["verifier_b64"])
+    except Exception:
+        return {"ok": False, "error": "Invalid verifier stored for user"}
+
+    try:
+        msg_client = b64d(req.msg_client_b64)
+    except Exception:
+        return {"ok": False, "error": "Invalid base64 for msg_client_b64"}
+
+    # SPAKE2 server side (use same idSymmetric on both sides)
+    server = SPAKE2_Symmetric(verifier, idSymmetric=b"pake-demo")
+    msg_server = server.start()
+
+    # derive the shared session key using client's message
+    try:
+        session_key = server.finish(msg_client)
+    except Exception as e:
+        return {"ok": False, "error": f"SPAKE2 finish failed: {e}"}
+
+    if not isinstance(session_key, (bytes, bytearray)):
+        session_key = bytes(session_key)
+
+    server_proof = hmac_sha256(session_key, b"server-proof")
+
+    # Persist only the session key (base64). No pickling of internal object.
+    session_id = secrets.token_hex(16)
+    sessions.insert_one({
+        "session_id": session_id,
+        "username": req.username,
+        "key_b64": b64e(session_key)
+    })
+    print("[DEBUG] login_start for user:", req.username)
+    print("[DEBUG] verifier (hex):", verifier.hex())
+    print("[DEBUG] msg_client_b64:", req.msg_client_b64)
+    print("[DEBUG] msg_server (b64):", b64e(msg_server))
+    print("[DEBUG] session_key (hex):", session_key.hex())
+    print("[DEBUG] server_proof (hex):", server_proof.hex())
 
 
-@app.post("/finalize-registration")
-async def finalize_registration(request: FinalizeRegisterRequest):
-    # This endpoint receives the final, client-generated verifier
-    print(f"Finalizing registration for {request.username}")
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "msg_server_b64": b64e(msg_server),
+        "server_proof_b64": b64e(server_proof),
+    }
+
+@app.post("/login/finish")
+def login_finish(req: LoginFinishRequest):
+    sess = sessions.find_one({"session_id": req.session_id})
+    if not sess:
+        return {"ok": False, "error": "Invalid session"}
+
+    try:
+        key = b64d(sess["key_b64"])
+    except Exception:
+        sessions.delete_one({"session_id": req.session_id})
+        return {"ok": False, "error": "Corrupt session key"}
+
+    expected = hmac_sha256(key, b"client-proof")
+    try:
+        client_proof = b64d(req.client_proof_b64)
+    except Exception:
+        sessions.delete_one({"session_id": req.session_id})
+        return {"ok": False, "error": "Invalid base64 for client_proof_b64"}
+
+    # Constant-time compare
+    if not hmac.compare_digest(expected, client_proof):
+        sessions.delete_one({"session_id": req.session_id})
+        return {"ok": False, "error": "Bad client proof"}
+
+    # Success — both sides share the same key derived from correct password
+    sessions.delete_one({"session_id": req.session_id})
     
-    # In a real application, you would add validation and check for existing users
     
-    DATABASE[request.username] = request.client_record
     
-    print(f"Stored record for {request.username}: {DATABASE[request.username]}")
     
-    return {"message": "Registration successful!", "username": request.username}
+    print("[DEBUG] login_finish for session:", req.session_id)
+    print("[DEBUG] loaded key (hex):", key.hex())
+    print("[DEBUG] expected client_proof (hex):", expected.hex())
+    print("[DEBUG] received client_proof (b64):", req.client_proof_b64)
+    print("[DEBUG] received client_proof (hex):", client_proof.hex())
+
+    return {"ok": True, "message": "Login successful"}
