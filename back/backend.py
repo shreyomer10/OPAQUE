@@ -9,8 +9,8 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from spake2 import SPAKE2_Symmetric
-from helper.converter import b64d,b64e,hmac_sha256
-from models.models import RegisterRequest,ChallengeRequest,LoginFinishRequest,LoginStartRequest
+from helper.converter import b64d, b64e, hmac_sha256
+from models.models import RegisterRequest, ChallengeRequest, LoginFinishRequest, LoginStartRequest
 
 load_dotenv()
 MONGO_URI = os.getenv("MONGO_URI")
@@ -28,6 +28,12 @@ sessions.create_index("session_id", unique=True)
 
 # ---------- FastAPI ----------
 app = FastAPI(title="SPAKE2 PAKE Demo with MongoDB")
+
+# A Pydantic model for the new protected endpoint's request body
+class ProtectedRequest(BaseModel):
+    session_id: str
+    message: str
+    message_proof_b64: str
 
 
 @app.get("/")
@@ -62,9 +68,6 @@ def login_challenge(req: ChallengeRequest):
 
 @app.post("/login/start")
 def login_start(req: LoginStartRequest):
-    # debug
-    print("LOGIN START request:", req)
-
     user = users.find_one({"username": req.username})
     if not user:
         return {"ok": False, "error": "User not found"}
@@ -79,11 +82,9 @@ def login_start(req: LoginStartRequest):
     except Exception:
         return {"ok": False, "error": "Invalid base64 for msg_client_b64"}
 
-    # SPAKE2 server side (use same idSymmetric on both sides)
     server = SPAKE2_Symmetric(verifier, idSymmetric=b"pake-demo")
     msg_server = server.start()
 
-    # derive the shared session key using client's message
     try:
         session_key = server.finish(msg_client)
     except Exception as e:
@@ -94,20 +95,19 @@ def login_start(req: LoginStartRequest):
 
     server_proof = hmac_sha256(session_key, b"server-proof")
 
-    # Persist only the session key (base64). No pickling of internal object.
     session_id = secrets.token_hex(16)
     sessions.insert_one({
         "session_id": session_id,
         "username": req.username,
         "key_b64": b64e(session_key)
     })
+
     print("[DEBUG] login_start for user:", req.username)
     print("[DEBUG] verifier (hex):", verifier.hex())
     print("[DEBUG] msg_client_b64:", req.msg_client_b64)
     print("[DEBUG] msg_server (b64):", b64e(msg_server))
     print("[DEBUG] session_key (hex):", session_key.hex())
     print("[DEBUG] server_proof (hex):", server_proof.hex())
-
 
     return {
         "ok": True,
@@ -140,11 +140,8 @@ def login_finish(req: LoginFinishRequest):
         sessions.delete_one({"session_id": req.session_id})
         return {"ok": False, "error": "Bad client proof"}
 
-    # Success — both sides share the same key derived from correct password
-    sessions.delete_one({"session_id": req.session_id})
-    
-    
-    
+    # Success — both sides share the same key. The session key is now ready for use.
+    # The session key is NOT deleted here to allow for further authentication.
     
     print("[DEBUG] login_finish for session:", req.session_id)
     print("[DEBUG] loaded key (hex):", key.hex())
@@ -152,4 +149,36 @@ def login_finish(req: LoginFinishRequest):
     print("[DEBUG] received client_proof (b64):", req.client_proof_b64)
     print("[DEBUG] received client_proof (hex):", client_proof.hex())
 
-    return {"ok": True, "message": "Login successful"}
+    return {"ok": True, "message": "Login successful. Session key is active."}
+
+@app.post("/protected")
+def protected_endpoint(req: ProtectedRequest):
+    # 1. Retrieve the session key from the database using the provided session ID.
+    sess = sessions.find_one({"session_id": req.session_id})
+    if not sess:
+        return {"ok": False, "error": "Invalid or expired session"}
+    
+    try:
+        key = b64d(sess["key_b64"])
+    except Exception:
+        return {"ok": False, "error": "Corrupt session key"}
+
+    # 2. Re-create the HMAC proof on the server side using the message and the stored key.
+    expected_proof = hmac_sha256(key, req.message.encode('utf-8'))
+    
+    # 3. Decode the proof sent by the client.
+    try:
+        client_proof = b64d(req.message_proof_b64)
+    except Exception:
+        return {"ok": False, "error": "Invalid base64 for client_proof_b64"}
+
+    # 4. Compare the proofs in constant time.
+    if not hmac.compare_digest(expected_proof, client_proof):
+        return {"ok": False, "error": "Invalid message proof"}
+        
+    # 5. Success! The message is authenticated.
+    return {
+        "ok": True,
+        "message": f"Welcome, {sess['username']}! Your authenticated message was: '{req.message}'"
+    }
+
